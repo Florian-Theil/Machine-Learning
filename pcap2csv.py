@@ -1,6 +1,9 @@
 import gzip
 import dpkt
 import struct
+from collections import defaultdict
+import pandas as pd
+
 
 def read_pcap_udp_payloads(filename):
     """
@@ -105,6 +108,91 @@ def decode_trading_message(msg_type, body):
     else:
         return dict(type='Unknown', raw=body.hex())
 
+class OrderBookManager:
+    """Maintains bid/ask dictionaries per symbol and produces feature rows."""
+
+    def __init__(self):
+        self.bids = defaultdict(dict)
+        self.asks = defaultdict(dict)
+
+    def update_book(self, msg):
+        """Update the order book and return a dict of derived features."""
+        if msg["type"] != "PriceLevelUpdate":
+            return None
+
+        symbol = msg["symbol"]
+        side   = msg["side"]
+        price  = msg["price"]
+        size   = msg["size"]
+        ts     = msg["ts"]
+
+        book = self.bids if side == "BUY" else self.asks
+
+        # Update or delete the level
+        if size == 0:
+            book[symbol].pop(price, None)
+        else:
+            book[symbol][price] = size
+
+        # Compute top of book if both sides exist
+        if self.bids[symbol] and self.asks[symbol]:
+            best_bid = max(self.bids[symbol])
+            best_ask = min(self.asks[symbol])
+            bid_size = self.bids[symbol][best_bid]
+            ask_size = self.asks[symbol][best_ask]
+
+            mid = 0.5 * (best_bid + best_ask)
+            spread = best_ask - best_bid
+            imbalance = (bid_size - ask_size) / (bid_size + ask_size)
+
+            return dict(
+                ts=ts,
+                symbol=symbol,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                bid_size=bid_size,
+                ask_size=ask_size,
+                mid=mid,
+                spread=spread,
+                imbalance=imbalance,
+            )
+        return None
+
+def stream_to_csv(filename, csv_path, chunk_size=10000, include_header=True):
+    manager = OrderBookManager()
+    chunk_records = []
+    row_count = 0
+
+    for ts, src, dst, sport, dport, payload in read_pcap_udp_payloads(filename):
+        for msg_type, body in parse_iex_deep_payload(payload):
+            msg = decode_trading_message(msg_type, body)
+            rec = manager.update_book(msg)
+            if rec:
+                chunk_records.append(rec)
+
+        if len(chunk_records) >= chunk_size:
+            df_chunk = pd.DataFrame.from_records(chunk_records)
+            df_chunk.to_csv(
+                csv_path,
+                mode="a",
+                index=False,
+                header=(include_header and row_count == 0),
+            )
+            row_count += len(df_chunk)
+            chunk_records.clear()
+
+    # flush remaining records
+    if chunk_records:
+        df_chunk = pd.DataFrame.from_records(chunk_records)
+        df_chunk.to_csv(
+            csv_path,
+            mode="a",
+            index=False,
+            header=(include_header and row_count == 0),
+        )
+
+    print(f"Finished writing {row_count:,} rows to {csv_path}")
+        
 if __name__ == "__main__":
     import sys
     from socket import inet_ntoa
@@ -113,16 +201,7 @@ if __name__ == "__main__":
         print("Usage: python pcap2csv.py file.pcap[.gz]")
         sys.exit(1)
     
-
     filename = sys.argv[1]
     count = 0
-    for ts, src, dst, sport, dport, payload in read_pcap_udp_payloads(filename):
-        for msg_type, body in parse_iex_deep_payload(payload):
-            msg = decode_trading_message(msg_type, body)
-            if msg["type"] != "Unknown":
-                count += 1
-                print(msg)
-        if count > 50:  # limit output for demo
-            break
-
-    print(f"\nDecoded {count} trading messages.")
+    
+    stream_to_csv(filename, "iex_book.csv", chunk_size=50000)
