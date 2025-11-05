@@ -1,6 +1,12 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+
+# Try importing matplotlib, but tolerate absence
+try:
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except ImportError:
+    HAVE_MPL = False
 
 
 def evaluate_strategies(h5_filename, dataset_name, strategies,
@@ -25,7 +31,7 @@ def evaluate_strategies(h5_filename, dataset_name, strategies,
     transaction_cost : float
         Proportional transaction cost (e.g. 0.0001 = 0.01%).
     plot : bool
-        Whether to plot all P&L curves.
+        Whether to plot all P&L curves (only if matplotlib available).
 
     Returns
     -------
@@ -43,14 +49,16 @@ def evaluate_strategies(h5_filename, dataset_name, strategies,
     if end_time:
         df = df[df['timestamp'] <= pd.to_datetime(end_time)]
 
-    # --- Helper: single strategy evaluator returning PnL series ---
+    # --- Helper: single strategy evaluator ---
     def _evaluate_one(strategy_func):
         trades = strategy_func(df)
         if not trades:
             return pd.Series(dtype=float)
 
         trades_df = pd.DataFrame(trades)
-        trades_df['timestamp'] = pd.to_datetime(trades_df.get('timestamp', df['timestamp'].iloc[0]))
+        trades_df['timestamp'] = pd.to_datetime(
+            trades_df.get('timestamp', df['timestamp'].iloc[0])
+        )
         trades_df = trades_df.sort_values('timestamp')
 
         cash = initial_cash
@@ -110,17 +118,18 @@ def evaluate_strategies(h5_filename, dataset_name, strategies,
     for name, func in strategies.items():
         pnl_df[name] = _evaluate_one(func)
 
-    # align on common time index
     pnl_df = pnl_df.sort_index().interpolate(method='time')
 
-    # --- Plot ---
-    if plot and not pnl_df.empty:
-        plt.figure(figsize=(8, 4))
-        pnl_df.plot(title="Cumulative P&L Comparison")
-        plt.xlabel("Time")
-        plt.ylabel("P&L")
-        plt.grid(True)
-        plt.show()
+    # --- Plot if available ---
+    if plot:
+        if HAVE_MPL and not pnl_df.empty:
+            pnl_df.plot(title="Cumulative P&L Comparison", figsize=(8, 4))
+            plt.xlabel("Time")
+            plt.ylabel("P&L")
+            plt.grid(True)
+            plt.show()
+        elif not HAVE_MPL:
+            print("[Info] matplotlib not available — skipping plot.")
 
     return pnl_df
 
@@ -179,7 +188,7 @@ if __name__ == "__main__":
     }
 
     pnl_df = evaluate_strategies(
-        h5_filename="data.h5",
+        h5_filename="resampled.h5",
         dataset_name="/deep",
         strategies=strategies,
         start_time="2025-10-17 09:30:00",

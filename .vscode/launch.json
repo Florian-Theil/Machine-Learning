@@ -11,7 +11,7 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "args": ["IEX_data/data_feeds_20251017_20251017_IEXTP1_DEEP1.0.pcap.gz", "output.csv"]
+            "args": ["IEX_data/data_feeds_20251017_20251017_IEXTP1_DEEP1.0.pcap.gz", "IEX_data/resampled.h5"]
         }
     ]
 }
