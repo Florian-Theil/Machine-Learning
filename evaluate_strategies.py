@@ -207,19 +207,6 @@ def momentum_strategy(df, window=20, threshold=0.002, trade_size=100):
     return trades
 
 
-def contrarian_strategy(df, window=20, threshold=0.002, trade_size=100):
-    trades = []
-    for sym, g in df.groupby("symbol"):
-        g = g.sort_values("timestamp")
-        g["ma"] = g["mid"].rolling(window, min_periods=1).mean()
-        for _, row in g.iterrows():
-            if row["mid"] > (1 + threshold) * row["ma"]:
-                trades.append({"timestamp": row["timestamp"], "symbol": sym, "side": "sell", "size": trade_size})
-            elif row["mid"] < (1 - threshold) * row["ma"]:
-                trades.append({"timestamp": row["timestamp"], "symbol": sym, "side": "buy", "size": trade_size})
-    return trades
-
-
 def random_strategy(df, prob=0.0005, trade_size=100):
     np.random.seed(42)
     trades = []
@@ -233,11 +220,10 @@ def random_strategy(df, prob=0.0005, trade_size=100):
                 trades.append({"timestamp": row["timestamp"], "symbol": sym, "side": "sell", "size": trade_size})
     return trades
 
-
 if __name__ == "__main__":
     strategies = {
         "Momentum": momentum_strategy,
-        "Contrarian": contrarian_strategy,
+        # "Contrarian": contrarian_strategy,
         "Random": random_strategy,
     }
 
@@ -256,21 +242,16 @@ if __name__ == "__main__":
         print(f"\n--- {k} ---")
         print(df_k.tail())
 
-    if (
-        "strategy_outcome" in results
-        and "Momentum" in results["strategy_outcome"].columns
-        and "Contrarian" in results["strategy_outcome"].columns
-    ):
-        s_m = results["strategy_outcome"]["Momentum"].iloc[-1]
-        s_c = results["strategy_outcome"]["Contrarian"].iloc[-1]
-        print(
-            f"\nSymmetry check:\n"
-            f"  StrategyOutcome(Momentum)    = {s_m:.2f}\n"
-            f"  StrategyOutcome(Contrarian)  = {s_c:.2f}\n"
-            f"  Sum (should be ≈ 0)          = {s_m + s_c:.2e}"
-        )
+    # Combine all P&L components into a single DataFrame with MultiIndex columns
+    combined = pd.concat(results, axis=1)  # outer keys = components, inner = strategies
 
-    for comp, df_comp in results.items():
-        out_name = f"pnl_{comp}.csv"
-        df_comp.to_csv(out_name)
-        print(f"[Saved] {out_name} with shape {df_comp.shape}")
+    # Ensure sorted timestamps and clean index
+    combined = combined.sort_index()
+    combined.index.name = "timestamp"
+
+    # Save to a single Excel file
+    output_file = "pnl_results_combined.xlsx"
+    combined.to_excel(output_file, engine="xlsxwriter")
+
+    print(f"[Saved combined results to] {output_file}")
+    print(f"Shape: {combined.shape}")
