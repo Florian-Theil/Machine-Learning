@@ -1,7 +1,6 @@
 import pandas as pd
 import numpy as np
 
-# Try importing matplotlib, but tolerate absence
 try:
     import matplotlib.pyplot as plt
     HAVE_MPL = True
@@ -9,193 +8,269 @@ except ImportError:
     HAVE_MPL = False
 
 
-def evaluate_strategies(h5_filename, dataset_name, strategies,
-                        start_time=None, end_time=None,
-                        initial_cash=0.0, transaction_cost=0.0001,
-                        plot=True):
-    """
-    Evaluate several trading strategies on IEX HDF5 data.
+def evaluate_strategies(
+    h5_filename,
+    dataset_name,
+    strategies,
+    start_time=None,
+    end_time=None,
+    initial_cash=0.0,
+    transaction_cost=0.0001,
+    plot=False,
+):
+    """Fast multi-strategy evaluator with P&L decomposition."""
 
-    Parameters
-    ----------
-    h5_filename : str
-        Path to the HDF5 file.
-    dataset_name : str
-        Dataset key (e.g. '/deep').
-    strategies : dict[str, callable]
-        Mapping of strategy names to functions df -> list of trade dicts.
-    start_time, end_time : str or datetime, optional
-        Restrict the evaluation period.
-    initial_cash : float
-        Starting balance.
-    transaction_cost : float
-        Proportional transaction cost (e.g. 0.0001 = 0.01%).
-    plot : bool
-        Whether to plot all P&L curves (only if matplotlib available).
-
-    Returns
-    -------
-    pnl_df : pd.DataFrame
-        Columns are strategy names; index is timestamp.
-    """
-
-    # --- Load data ---
     df = pd.read_hdf(h5_filename, dataset_name)
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df = df.sort_values('timestamp')
-
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp")
     if start_time:
-        df = df[df['timestamp'] >= pd.to_datetime(start_time)]
+        df = df[df["timestamp"] >= pd.to_datetime(start_time)]
     if end_time:
-        df = df[df['timestamp'] <= pd.to_datetime(end_time)]
+        df = df[df["timestamp"] <= pd.to_datetime(end_time)]
 
-    # --- Helper: single strategy evaluator ---
+    # --- Pre-group data by symbol ---
+    data_by_symbol = {}
+    for sym, g in df.groupby("symbol"):
+        g = g.sort_values("timestamp")
+        data_by_symbol[sym] = {
+            "ts_array": g["timestamp"].values.astype("datetime64[ns]"),
+            "best_bid": g["best_bid"].to_numpy(),
+            "best_ask": g["best_ask"].to_numpy(),
+            "mid": g["mid"].to_numpy(),
+        }
+
     def _evaluate_one(strategy_func):
         trades = strategy_func(df)
         if not trades:
-            return pd.Series(dtype=float)
+            cols = ["strategy_outcome", "spread_loss", "transaction_cost", "PnL_total"]
+            return pd.DataFrame(columns=cols).set_index(pd.DatetimeIndex([], name="timestamp"))
 
         trades_df = pd.DataFrame(trades)
-        trades_df['timestamp'] = pd.to_datetime(
-            trades_df.get('timestamp', df['timestamp'].iloc[0])
+        trades_df["timestamp"] = pd.to_datetime(
+            trades_df.get("timestamp", df["timestamp"].iloc[0])
         )
-        trades_df = trades_df.sort_values('timestamp')
+        trades_df = trades_df.sort_values("timestamp")
 
-        cash = initial_cash
-        positions = {}
-        pnl_records = []
+        cash_actual = initial_cash
+        cash_mid = initial_cash
+        pos_actual, pos_mid = {}, {}
+        spread_loss_cum = 0.0
+        tx_cost_cum = 0.0
+        rec = []
+        last_mid = {}
 
-        for _, trade in trades_df.iterrows():
-            sym = trade['symbol']
-            side = trade['side']
-            size = trade['size']
-
-            # nearest market snapshot
-            snapshot = df[df['symbol'] == sym]
-            if snapshot.empty:
+        # Group trades by symbol
+        for sym, tgroup in trades_df.groupby("symbol"):
+            if sym not in data_by_symbol:
                 continue
-            idx = snapshot['timestamp'].searchsorted(trade['timestamp'])
-            idx = min(idx, len(snapshot) - 1)
-            row = snapshot.iloc[idx]
+            gdata = data_by_symbol[sym]
+            ts_array = gdata["ts_array"]
+            bids = gdata["best_bid"]
+            asks = gdata["best_ask"]
+            mids = gdata["mid"]
 
-            if side == 'buy':
-                exec_price = row['best_ask']
-                cash -= exec_price * size * (1 + transaction_cost)
-                positions[sym] = positions.get(sym, 0) + size
-            elif side == 'sell':
-                exec_price = row['best_bid']
-                cash += exec_price * size * (1 - transaction_cost)
-                positions[sym] = positions.get(sym, 0) - size
+            for _, tr in tgroup.iterrows():
+                side = tr["side"]
+                size = float(tr["size"])
+                ts_val = np.datetime64(tr["timestamp"], "ns")
 
-            # mark to market
-            mtm = 0.0
-            for s, qty in positions.items():
-                if qty == 0:
-                    continue
-                local = df[df['symbol'] == s]
-                mid = local.iloc[min(idx, len(local)-1)]['mid']
-                mtm += qty * mid
-            total_value = cash + mtm
-            pnl_records.append((trade['timestamp'], total_value - initial_cash))
+                idx = np.searchsorted(ts_array, ts_val)
+                if idx >= len(ts_array):
+                    idx = len(ts_array) - 1
 
-        # final liquidation
-        final_time = df['timestamp'].iloc[-1]
-        mtm = 0.0
-        for s, qty in positions.items():
-            if qty != 0:
-                current_mid = df[df['symbol'] == s]['mid'].iloc[-1]
-                mtm += qty * current_mid
-        pnl_records.append((final_time, cash + mtm - initial_cash))
+                bid = bids[idx]
+                ask = asks[idx]
+                mid = mids[idx]
+                spread = ask - bid
 
-        return pd.Series(
-            [p for _, p in pnl_records],
-            index=[t for t, _ in pnl_records],
-            name='PnL'
+                # Actual execution
+                exec_price = ask if side == "buy" else bid
+                if side == "buy":
+                    cash_actual -= exec_price * size * (1 + transaction_cost)
+                    pos_actual[sym] = pos_actual.get(sym, 0.0) + size
+                else:
+                    cash_actual += exec_price * size * (1 - transaction_cost)
+                    pos_actual[sym] = pos_actual.get(sym, 0.0) - size
+
+                # Mid execution (strategy outcome)
+                if side == "buy":
+                    cash_mid -= mid * size
+                    pos_mid[sym] = pos_mid.get(sym, 0.0) + size
+                else:
+                    cash_mid += mid * size
+                    pos_mid[sym] = pos_mid.get(sym, 0.0) - size
+
+                spread_loss_cum += 0.5 * spread * size
+                tx_cost_cum += transaction_cost * exec_price * size
+                last_mid[sym] = mid
+
+                mtm_actual = sum(q * last_mid[s] for s, q in pos_actual.items() if s in last_mid)
+                mtm_mid = sum(q * last_mid[s] for s, q in pos_mid.items() if s in last_mid)
+                strategy_outcome = (cash_mid + mtm_mid) - initial_cash
+                pnl_total = (cash_actual + mtm_actual) - initial_cash
+
+                rec.append(
+                    (
+                        tr["timestamp"],
+                        strategy_outcome,
+                        -abs(spread_loss_cum),
+                        -abs(tx_cost_cum),
+                        pnl_total,
+                    )
+                )
+
+        # Final liquidation
+        final_t = df["timestamp"].iloc[-1]
+        mtm_actual = sum(
+            q * df.loc[df["symbol"] == s, "mid"].iloc[-1]
+            for s, q in pos_actual.items()
+            if s in df["symbol"].values
+        )
+        mtm_mid = sum(
+            q * df.loc[df["symbol"] == s, "mid"].iloc[-1]
+            for s, q in pos_mid.items()
+            if s in df["symbol"].values
+        )
+        strategy_outcome = (cash_mid + mtm_mid) - initial_cash
+        pnl_total = (cash_actual + mtm_actual) - initial_cash
+
+        rec.append(
+            (
+                final_t,
+                strategy_outcome,
+                -abs(spread_loss_cum),
+                -abs(tx_cost_cum),
+                pnl_total,
+            )
         )
 
-    # --- Run all strategies ---
-    pnl_df = pd.DataFrame()
+        out = pd.DataFrame(
+            rec,
+            columns=[
+                "timestamp",
+                "strategy_outcome",
+                "spread_loss",
+                "transaction_cost",
+                "PnL_total",
+            ],
+        ).set_index("timestamp")
+
+        out = out[~out.index.duplicated(keep="last")]
+        return out
+
+    components = ["strategy_outcome", "spread_loss", "transaction_cost", "PnL_total"]
+    results = {c: pd.DataFrame() for c in components}
+
     for name, func in strategies.items():
-        pnl_df[name] = _evaluate_one(func)
+        print(f"Evaluating strategy: {name}")
+        comp_df = _evaluate_one(func)
+        for c in components:
+            results[c][name] = comp_df[c]
 
-    pnl_df = pnl_df.sort_index().interpolate(method='time')
+    for c in components:
+        if not results[c].empty:
+            results[c].index = pd.to_datetime(results[c].index)
+            results[c] = results[c].sort_index()
+            results[c] = results[c][~results[c].index.duplicated(keep="last")]
+            results[c] = results[c].interpolate(method="time")
 
-    # --- Plot if available ---
-    if plot:
-        if HAVE_MPL and not pnl_df.empty:
-            pnl_df.plot(title="Cumulative P&L Comparison", figsize=(8, 4))
-            plt.xlabel("Time")
-            plt.ylabel("P&L")
-            plt.grid(True)
-            plt.show()
-        elif not HAVE_MPL:
-            print("[Info] matplotlib not available — skipping plot.")
+    if plot and HAVE_MPL:
+        plt.figure(figsize=(9, 4))
+        results["PnL_total"].plot(title="Total P&L (BBO exec + costs, marked to mid)")
+        plt.xlabel("Time")
+        plt.ylabel("P&L")
+        plt.grid(True)
+        plt.show()
 
-    return pnl_df
+        plt.figure(figsize=(9, 4))
+        results["strategy_outcome"].plot(title="Strategy Outcome at Mid, Zero Cost (sign-symmetric)")
+        plt.xlabel("Time")
+        plt.ylabel("Value")
+        plt.grid(True)
+        plt.show()
+    elif plot and not HAVE_MPL:
+        print("[Info] matplotlib not available — skipping plot.")
 
-
-# --- Example strategies ---
-
-def moving_average_strategy(df, window=20, threshold=0.005, trade_size=100):
-    """Mean reversion: buy if mid < (1-threshold)*MA, sell if > (1+threshold)*MA."""
-    trades = []
-    for sym, g in df.groupby('symbol'):
-        g = g.sort_values('timestamp')
-        g['ma'] = g['mid'].rolling(window, min_periods=1).mean()
-        for _, row in g.iterrows():
-            if row['mid'] < (1 - threshold)*row['ma']:
-                trades.append({'timestamp': row['timestamp'], 'symbol': sym, 'side': 'buy', 'size': trade_size})
-            elif row['mid'] > (1 + threshold)*row['ma']:
-                trades.append({'timestamp': row['timestamp'], 'symbol': sym, 'side': 'sell', 'size': trade_size})
-    return trades
+    return results
 
 
 def momentum_strategy(df, window=20, threshold=0.002, trade_size=100):
-    """Momentum: buy if mid > MA*(1+threshold), sell if mid < MA*(1-threshold)."""
     trades = []
-    for sym, g in df.groupby('symbol'):
-        g = g.sort_values('timestamp')
-        g['ma'] = g['mid'].rolling(window, min_periods=1).mean()
+    for sym, g in df.groupby("symbol"):
+        g = g.sort_values("timestamp")
+        g["ma"] = g["mid"].rolling(window, min_periods=1).mean()
         for _, row in g.iterrows():
-            if row['mid'] > (1 + threshold)*row['ma']:
-                trades.append({'timestamp': row['timestamp'], 'symbol': sym, 'side': 'buy', 'size': trade_size})
-            elif row['mid'] < (1 - threshold)*row['ma']:
-                trades.append({'timestamp': row['timestamp'], 'symbol': sym, 'side': 'sell', 'size': trade_size})
+            if row["mid"] > (1 + threshold) * row["ma"]:
+                trades.append({"timestamp": row["timestamp"], "symbol": sym, "side": "buy", "size": trade_size})
+            elif row["mid"] < (1 - threshold) * row["ma"]:
+                trades.append({"timestamp": row["timestamp"], "symbol": sym, "side": "sell", "size": trade_size})
+    return trades
+
+
+def contrarian_strategy(df, window=20, threshold=0.002, trade_size=100):
+    trades = []
+    for sym, g in df.groupby("symbol"):
+        g = g.sort_values("timestamp")
+        g["ma"] = g["mid"].rolling(window, min_periods=1).mean()
+        for _, row in g.iterrows():
+            if row["mid"] > (1 + threshold) * row["ma"]:
+                trades.append({"timestamp": row["timestamp"], "symbol": sym, "side": "sell", "size": trade_size})
+            elif row["mid"] < (1 - threshold) * row["ma"]:
+                trades.append({"timestamp": row["timestamp"], "symbol": sym, "side": "buy", "size": trade_size})
     return trades
 
 
 def random_strategy(df, prob=0.0005, trade_size=100):
-    """Random buy/sell decisions for testing."""
     np.random.seed(42)
     trades = []
-    for sym, g in df.groupby('symbol'):
-        g = g.sort_values('timestamp')
+    for sym, g in df.groupby("symbol"):
+        g = g.sort_values("timestamp")
         for _, row in g.iterrows():
             r = np.random.rand()
             if r < prob:
-                trades.append({'timestamp': row['timestamp'], 'symbol': sym, 'side': 'buy', 'size': trade_size})
-            elif r < 2*prob:
-                trades.append({'timestamp': row['timestamp'], 'symbol': sym, 'side': 'sell', 'size': trade_size})
+                trades.append({"timestamp": row["timestamp"], "symbol": sym, "side": "buy", "size": trade_size})
+            elif r < 2 * prob:
+                trades.append({"timestamp": row["timestamp"], "symbol": sym, "side": "sell", "size": trade_size})
     return trades
 
 
-# --- Example run ---
 if __name__ == "__main__":
     strategies = {
-        "MeanReversion": moving_average_strategy,
         "Momentum": momentum_strategy,
+        "Contrarian": contrarian_strategy,
         "Random": random_strategy,
     }
 
-    pnl_df = evaluate_strategies(
-        h5_filename="resampled.h5",
+    results = evaluate_strategies(
+        h5_filename="IEX_data/resampled.h5",
         dataset_name="/deep",
         strategies=strategies,
-        start_time="2025-10-17 09:30:00",
-        end_time="2025-10-17 16:00:00",
+        start_time="2025-10-17 12:00:00",
+        end_time="2025-10-17 12:00:10",
         initial_cash=1_000_000.0,
         transaction_cost=0.0001,
-        plot=True
+        plot=False,
     )
 
-    print(pnl_df.tail())
+    for k, df_k in results.items():
+        print(f"\n--- {k} ---")
+        print(df_k.tail())
+
+    if (
+        "strategy_outcome" in results
+        and "Momentum" in results["strategy_outcome"].columns
+        and "Contrarian" in results["strategy_outcome"].columns
+    ):
+        s_m = results["strategy_outcome"]["Momentum"].iloc[-1]
+        s_c = results["strategy_outcome"]["Contrarian"].iloc[-1]
+        print(
+            f"\nSymmetry check:\n"
+            f"  StrategyOutcome(Momentum)    = {s_m:.2f}\n"
+            f"  StrategyOutcome(Contrarian)  = {s_c:.2f}\n"
+            f"  Sum (should be ≈ 0)          = {s_m + s_c:.2e}"
+        )
+
+    for comp, df_comp in results.items():
+        out_name = f"pnl_{comp}.csv"
+        df_comp.to_csv(out_name)
+        print(f"[Saved] {out_name} with shape {df_comp.shape}")
