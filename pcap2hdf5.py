@@ -1,4 +1,6 @@
 import gzip
+import os
+from pandas.core.arrays import base
 import dpkt
 import struct
 from collections import defaultdict
@@ -174,7 +176,7 @@ class OrderBookManager:
 # 4️⃣ RESAMPLING TO FIXED FREQUENCY
 # ---------------------------------------------------------------------
 
-def resample_chunk(df, freq="100ms"):
+def resample(df, freq="100ms"):
     """
     Convert an irregular stream of order-book updates into a
     fixed-frequency (e.g. every 100 ms) time series.
@@ -200,7 +202,7 @@ def resample_chunk(df, freq="100ms"):
 # 5️⃣ MAIN STREAMING PIPELINE
 # ---------------------------------------------------------------------
 
-def stream_to_hdf5(pcap_file, h5_path, chunk_size=10000, freq="100ms"):
+def stream_to_hdf5(pcap_file, h5_path, chunk_size=500000, freq="100ms"):
     """
     Read packets from `pcap_file`, decode IEX DEEP updates, compute
     top-of-book features, resample to fixed frequency, and append to
@@ -217,7 +219,7 @@ def stream_to_hdf5(pcap_file, h5_path, chunk_size=10000, freq="100ms"):
     freq : str, optional
         Resampling frequency, pandas-style (default '100ms').
     """
-    stop_after = pd.Timedelta("1min")
+    stop_after = pd.Timedelta("365days")  # for testing, limit to 1 year
     # stop_after = pd.Timedelta("365days")  # for full file processing
     start_ts = None
     
@@ -226,7 +228,9 @@ def stream_to_hdf5(pcap_file, h5_path, chunk_size=10000, freq="100ms"):
     total_rows = 0
 
     # Open the HDF5 file (compressed with Blosc)
-    store = pd.HDFStore(h5_path, mode="w", complevel=9, complib="blosc")
+    base, ext = os.path.splitext(h5_path)
+    temp_file = f"{base}_temp{ext}"
+    store = pd.HDFStore(temp_file, mode="w", complevel=2, complib="blosc")
 
     # Main streaming loop over packets
     for ts, payload in read_pcap_udp_payloads(pcap_file):
@@ -236,33 +240,37 @@ def stream_to_hdf5(pcap_file, h5_path, chunk_size=10000, freq="100ms"):
             if rec:
                 recs.append(rec)
                 
-                # Check time limit
                 if start_ts is None:
                     start_ts = pd.to_datetime(rec["ts"], unit="ns")
                 current_ts = pd.to_datetime(rec["ts"], unit="ns")
-                if current_ts - start_ts > stop_after:
-                    print("Reached one minute of data, stopping.")
-                break
+        # Check time limit
         if start_ts and current_ts - start_ts > stop_after:
+            print(f"Reached {stop_after} time of data, stopping.")
             break
 
         # Once we reach chunk_size, convert to DataFrame and write
         if len(recs) >= chunk_size:
             df = pd.DataFrame.from_records(recs)
-            df_rs = resample_chunk(df, freq=freq)
-            store.append("deep", df_rs, format="table", data_columns=["symbol"])
-            total_rows += len(df_rs)
+            # df_rs = resample_chunk(df, freq=freq)
+            store.append("deep", df, format="table", data_columns=["symbol"])
+            total_rows += len(df)
             recs.clear()
-            print(f"Written {total_rows:,} resampled rows so far...")
+            print(f"Written {total_rows:,} rows so far...")
 
     # Write any leftover records
     if recs:
         df = pd.DataFrame.from_records(recs)
-        df_rs = resample_chunk(df, freq=freq)
-        store.append("deep", df_rs, format="table", data_columns=["symbol"])
-        total_rows += len(df_rs)
+        # df_rs = resample_chunk(df, freq=freq)
+        store.append("deep", df, format="table", data_columns=["symbol"])
+        total_rows += len(df)
 
     store.close()
+    # Now resample the data in the HDF5 file
+    print("Resampling data to fixed frequency...")
+    df = pd.read_hdf(temp_file, "deep")
+    df_rs = resample(df, freq="100ms")
+    df_rs.to_hdf(h5_path, key="deep", format="table")
+    
     print(f"✅ Finished: {total_rows:,} rows saved to {h5_path}")
         
 if __name__ == "__main__":
@@ -276,4 +284,4 @@ if __name__ == "__main__":
     hdf5file = sys.argv[2]
     count = 0
     
-    stream_to_hdf5(pcapfile, hdf5file, chunk_size=50000)
+    stream_to_hdf5(pcapfile, hdf5file, chunk_size=500000)
