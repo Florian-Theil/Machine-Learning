@@ -61,7 +61,7 @@ def decode_trading_message(msg_type, body):
         side = 'BUY' if msg_type == '8' else 'SELL'
         event_flags = body[0]
         ts, = struct.unpack_from("<Q", body, 1)
-        symbol = body[9:17].decode('ascii').strip('\x00 ')
+        symbol = body[9:17].decode('ascii')#.strip('\x00 ')
         size, = struct.unpack_from("<I", body, 17)
         price_int, = struct.unpack_from("<q", body, 21)
         price = price_int / 10000.0

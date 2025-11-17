@@ -1,10 +1,16 @@
 import pandas as pd
+if __name__ == "__main__":
 
-h5_path = "IEX_data/resampled.h5"
-
-# Open the HDF5 store and list all keys
-with pd.HDFStore(h5_path, mode="r") as store:
-    print("Keys in file:", store.keys())
-    df = store.select(store.keys()[0], stop=5)
-    print("Columns:", df.columns.tolist())
+    with pd.HDFStore("Data/raw_orderbook.h5", "r") as s:
+        print(s.get_storer("deep").nrows)
+    
+    with pd.HDFStore("Data/raw_orderbook.h5", "r") as s:
+        df0 = s.select("deep", start=0, stop=5)
+        print(df0.columns)
+        print(df0.head())
+        
+    print("Inspecting resampled data:") 
+    df = pd.read_hdf("Data/resampled.h5", "deep")
+    print(df.shape)
     print(df.head())
+    print(df.tail())
