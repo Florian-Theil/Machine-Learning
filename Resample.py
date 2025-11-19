@@ -21,6 +21,7 @@ if __name__ == "__main__":
     
     for chunk in iter:
         count += 1
+        print
         chunk["ts"] = pd.to_datetime(chunk["ts"])
         chunk = chunk.set_index("ts")
 
